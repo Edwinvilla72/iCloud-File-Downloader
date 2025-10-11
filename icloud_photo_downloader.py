@@ -83,41 +83,57 @@ class iCloudDownloaderApp:
             messagebox.showerror("Login Error", str(e))
             self.log(f"Login failed: {e}")
 
+
+    # downloads each individual file
+    # if photo, follow photo rules, else, its a drive file
     def download_file(self, file_obj, folder_path, file_name):
         try:
-            item_data = getattr(file_obj, "item", {})
-            url = item_data.get("downloadURL", None)
-
-            if not url:
-                self.log(f"Skipping {file_name}: No download URL.")
-                return
-
             os.makedirs(folder_path, exist_ok=True)
             file_path = os.path.join(folder_path, file_name)
 
-            response = self.api.session.get(url, stream=True)
-            if response.status_code == 200:
+            # ---- Case 1: iCloud Photos ----
+            if hasattr(file_obj, "download"):
+                self.log(f"Downloading photo/video: {file_name}")
+                response = file_obj.download()
                 with open(file_path, "wb") as f:
-                    total = int(response.headers.get('content-length', 0))
-                    downloaded = 0
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            percent = int((downloaded / total) * 100) if total else 0
-                            self.log(f"Downloading {file_name}: {percent}%")
+                    f.write(response.raw.read())
                 self.log(f"Downloaded {file_name} to {folder_path}")
 
-                if self.delete_after_download.get():
-                    try:
-                        file_obj.delete()
-                        self.log(f"Deleted {file_name} from iCloud.")
-                    except Exception as del_err:
-                        self.log(f"Failed to delete {file_name}: {del_err}")
+            # ---- Case 2: iCloud Drive Files ----
             else:
-                self.log(f"Failed to download {file_name}: HTTP {response.status_code}")
+                item_data = getattr(file_obj, "item", {})
+                url = item_data.get("downloadURL", None)
+                if not url:
+                    self.log(f"Skipping {file_name}: No download URL.")
+                    return
+
+                self.log(f"Downloading drive file: {file_name}")
+                response = self.api.session.get(url, stream=True)
+                if response.status_code == 200:
+                    with open(file_path, "wb") as f:
+                        total = int(response.headers.get("content-length", 0))
+                        downloaded = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                percent = int((downloaded / total) * 100) if total else 0
+                                self.log(f"Downloading {file_name}: {percent}%")
+                    self.log(f"Downloaded {file_name} to {folder_path}")
+                else:
+                    self.log(f"Failed to download {file_name}: HTTP {response.status_code}")
+
+            # ---- Optional deletion after download ----
+            if self.delete_after_download.get():
+                try:
+                    file_obj.delete()
+                    self.log(f"Deleted {file_name} from iCloud.")
+                except Exception as del_err:
+                    self.log(f"Failed to delete {file_name}: {del_err}")
+
         except Exception as e:
             self.log(f"Error downloading {file_name}: {e}")
+
 
     def download_photos(self):
         if not self.api or not self.download_dir.get():
