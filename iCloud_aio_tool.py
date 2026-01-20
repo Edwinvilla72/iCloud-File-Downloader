@@ -173,48 +173,28 @@ class iCloudDataManagerApp:
         ttk.Label(self.drive_frame, text="Drive files mirror your iCloud Drive structure.",
                   foreground="#555").pack()
 
-    def _build_emails_tab(self):
-        pad = {"padx": 8, "pady": 6}
-        ttk.Label(self.emails_frame, text="IMAP App-Specific Password:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(self.emails_frame, textvariable=self.imap_app_password, show="*", width=45).grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(self.emails_frame, text="Connect & List Folders", command=self.list_email_folders).grid(row=0, column=2, sticky="w", **pad)
 
-        ttk.Label(self.emails_frame, text="Select Mailbox:").grid(row=1, column=0, sticky="w", **pad)
-        self.mailbox_combo = ttk.Combobox(self.emails_frame, textvariable=self.selected_mailbox, width=40, state="readonly", values=[])
-        self.mailbox_combo.grid(row=1, column=1, sticky="ew", **pad)
+    # def _build_backups_tab(self):
+    #     pad = {"padx": 8, "pady": 6}
+    #     cols = ("name", "model", "backup_enabled", "last_backup")
+    #     self.devices_tree = ttk.Treeview(self.backup_frame, columns=cols, show="headings", height=8)
+    #     for c, w in zip(cols, (220, 140, 140, 180)):
+    #         self.devices_tree.heading(c, text=c.replace("_", " ").title())
+    #         self.devices_tree.column(c, width=w, anchor="w")
+    #     self.devices_tree.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=8, pady=(8, 2))
 
-        ttk.Button(self.emails_frame, text="Download Selected Mailbox",
-                   command=lambda: threading.Thread(target=self.download_selected_mailbox, daemon=True).start()
-                   ).grid(row=1, column=2, sticky="w", **pad)
+    #     ttk.Button(self.backup_frame, text="Refresh Device List",
+    #                command=lambda: threading.Thread(target=self.load_devices, daemon=True).start()
+    #                ).grid(row=1, column=0, sticky="w", **pad)
 
-        help_text = ("Notes:\n"
-                     "• IMAP: imap.mail.me.com:993 (SSL)\n"
-                     "• Username = Apple ID email; Password = APP-SPECIFIC PASSWORD\n"
-                     "• Saves .eml + attachment subfolders")
-        ttk.Label(self.emails_frame, text=help_text, foreground="#555", justify="left").grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0,10))
-        self.emails_frame.columnconfigure(1, weight=1)
+    #     self.backup_instructions = ScrolledText(self.backup_frame, height=14)
+    #     self.backup_instructions.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=8, pady=(2, 8))
 
-    def _build_backups_tab(self):
-        pad = {"padx": 8, "pady": 6}
-        cols = ("name", "model", "backup_enabled", "last_backup")
-        self.devices_tree = ttk.Treeview(self.backup_frame, columns=cols, show="headings", height=8)
-        for c, w in zip(cols, (220, 140, 140, 180)):
-            self.devices_tree.heading(c, text=c.replace("_", " ").title())
-            self.devices_tree.column(c, width=w, anchor="w")
-        self.devices_tree.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=8, pady=(8, 2))
+    #     self.backup_frame.rowconfigure(0, weight=1)
+    #     self.backup_frame.rowconfigure(2, weight=1)
+    #     self.backup_frame.columnconfigure(0, weight=1)
 
-        ttk.Button(self.backup_frame, text="Refresh Device List",
-                   command=lambda: threading.Thread(target=self.load_devices, daemon=True).start()
-                   ).grid(row=1, column=0, sticky="w", **pad)
-
-        self.backup_instructions = ScrolledText(self.backup_frame, height=14)
-        self.backup_instructions.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=8, pady=(2, 8))
-
-        self.backup_frame.rowconfigure(0, weight=1)
-        self.backup_frame.rowconfigure(2, weight=1)
-        self.backup_frame.columnconfigure(0, weight=1)
-
-        self.populate_backup_instructions()
+        # self.populate_backup_instructions()
 
     def _build_messages_tab(self):
         pad = {"padx": 8, "pady": 6}
@@ -392,117 +372,6 @@ class iCloudDataManagerApp:
             self.log("Drive files download complete.")
         except Exception as e:
             self.log(f"Drive download error: {e}")
-
-    # ---------------------------
-    # Emails via IMAP
-    # ---------------------------
-    def ensure_imap_connected(self) -> bool:
-        if self.imap:
-            return True
-        user = self.apple_id.get().strip()
-        app_pw = self.imap_app_password.get().strip()
-        if not user or not app_pw:
-            messagebox.showerror("IMAP Login", "Enter Apple ID (Login tab) and APP-SPECIFIC PASSWORD (Emails tab).")
-            return False
-        try:
-            self.imap = imaplib.IMAP4_SSL("imap.mail.me.com", 993)
-            self.imap.login(user, app_pw)
-            self.log("IMAP: Logged in.")
-            return True
-        except imaplib.IMAP4.error as e:
-            self.log(f"IMAP login failed: {e}")
-            messagebox.showerror("IMAP Login Error", str(e))
-            self.imap = None
-            return False
-
-    def list_email_folders(self):
-        if not self.ensure_imap_connected():
-            return
-        try:
-            typ, data = self.imap.list()
-            if typ != "OK":
-                raise Exception("Failed to list folders")
-            self.mailboxes = []
-            for raw in data:
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="ignore")
-                m = re.findall(r'"([^"]+)"', line)
-                folder = m[-1] if m else line.split()[-1]
-                self.mailboxes.append(folder)
-            self.mailboxes = sorted(set(self.mailboxes))
-            self.mailbox_combo["values"] = self.mailboxes
-            if self.mailboxes:
-                self.mailbox_combo.current(0)
-            self.log(f"IMAP: {len(self.mailboxes)} folders found.")
-        except Exception as e:
-            self.log(f"Error listing folders: {e}")
-
-    def download_selected_mailbox(self):
-        if not self.download_dir.get():
-            self.log("Choose a download folder (Login tab).")
-            return
-        if not self.ensure_imap_connected():
-            return
-        mailbox = self.selected_mailbox.get().strip() or "INBOX"
-        self.log(f"Downloading mailbox: {mailbox}")
-        try:
-            typ, _ = self.imap.select(f'"{mailbox}"', readonly=True)
-            if typ != "OK":
-                raise Exception(f"Unable to select {mailbox}")
-            typ, data = self.imap.search(None, "ALL")
-            if typ != "OK":
-                raise Exception("Search failed")
-            msg_ids = data[0].split()
-            save_base = os.path.join(self.download_dir.get(), "Emails", sanitize_filename(mailbox))
-            os.makedirs(save_base, exist_ok=True)
-            for idx, msg_id in enumerate(msg_ids, start=1):
-                try:
-                    typ, msg_data = self.imap.fetch(msg_id, "(RFC822)")
-                    if typ != "OK" or not msg_data or not msg_data[0]:
-                        continue
-                    raw_bytes = msg_data[0][1]
-                    msg = email.message_from_bytes(raw_bytes)
-                    date_hdr = msg.get("Date", "")
-                    try:
-                        dt = email.utils.parsedate_to_datetime(date_hdr) if date_hdr else None
-                    except Exception:
-                        dt = None
-                    date_part = dt.strftime("%Y-%m-%d_%H-%M-%S") if dt else f"id-{msg_id.decode()}"
-                    subject_hdr = msg.get("Subject", "")
-                    try:
-                        subject_decoded = str(make_header(decode_header(subject_hdr))) if subject_hdr else "No Subject"
-                    except Exception:
-                        subject_decoded = subject_hdr or "No Subject"
-                    filename_core = sanitize_filename(f"{date_part} - {subject_decoded}")
-                    eml_path = os.path.join(save_base, f"{filename_core}.eml")
-                    with open(eml_path, "wb") as f:
-                        f.write(raw_bytes)
-                    attach_dir = os.path.join(save_base, f"{filename_core}_attachments")
-                    saved_any = False
-                    for part in msg.walk():
-                        cd = (part.get("Content-Disposition") or "").lower()
-                        if "attachment" in cd:
-                            fname = part.get_filename()
-                            if fname:
-                                try:
-                                    fname = str(make_header(decode_header(fname)))
-                                except Exception:
-                                    pass
-                            fname = sanitize_filename(fname or "attachment.bin", max_len=100)
-                            os.makedirs(attach_dir, exist_ok=True)
-                            payload = part.get_payload(decode=True)
-                            if payload is not None:
-                                with open(os.path.join(attach_dir, fname), "wb") as af:
-                                    af.write(payload)
-                                saved_any = True
-                    if saved_any:
-                        self.log(f"[{idx}/{len(msg_ids)}] Saved .eml + attachments")
-                except Exception as inner_e:
-                    self.log(f"Message fetch error: {inner_e}")
-            self.log(f"Mailbox '{mailbox}' saved to: {save_base}")
-        except Exception as e:
-            self.log(f"Error downloading mailbox: {e}")
 
     # ---------------------------
     # Backups
