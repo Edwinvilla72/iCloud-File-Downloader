@@ -122,8 +122,8 @@ class iCloudDataManagerApp:
         notebook.add(self.login_frame,    text="Login")
         notebook.add(self.photos_frame,   text="Photos")
         notebook.add(self.drive_frame,    text="Drive")
-        notebook.add(self.emails_frame,   text="Emails")
-        notebook.add(self.backup_frame,   text="Backups")
+        # notebook.add(self.emails_frame,   text="Emails")
+        # notebook.add(self.backup_frame,   text="Backups")
         notebook.add(self.messages_frame, text="Messages")
 
         # Login Tab
@@ -136,8 +136,7 @@ class iCloudDataManagerApp:
         # Other tabs
         self._build_photos_tab()
         self._build_drive_tab()
-        self._build_emails_tab()
-        self._build_backups_tab()
+        # self._build_backups_tab()
         self._build_messages_tab()
 
     def _build_login_tab(self):
