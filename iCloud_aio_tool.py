@@ -156,8 +156,7 @@ class iCloudDataManagerApp:
         ttk.Button(self.login_frame, text="Login to iCloud", command=self.login).grid(row=4, column=0, columnspan=2, **pad)
         self.login_frame.columnconfigure(1, weight=1)
 
-        tip = ("Tip: For Emails, create an APP-SPECIFIC PASSWORD at appleid.apple.com.\n"
-               "2FA codes will be requested after iCloud login if required.")
+        tip = ("2FA codes will be requested after iCloud login if required.")
         ttk.Label(self.login_frame, text=tip, foreground="#555").grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(0,10))
 
     def _build_photos_tab(self):
