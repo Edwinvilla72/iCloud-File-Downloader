@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+from PyInstaller.utils.hooks import collect_data_files
 
 
 runtime_tmpdir = os.path.join(
@@ -8,11 +9,13 @@ runtime_tmpdir = os.path.join(
     "iCloud_aio_tool",
 )
 
+fido2_datas = collect_data_files("fido2")
+
 a = Analysis(
     ['iCloud_aio_tool.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=fido2_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

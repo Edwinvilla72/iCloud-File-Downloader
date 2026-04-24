@@ -28,6 +28,24 @@ from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
 from tkinter import Canvas, Frame, Label
 
+
+class _WindowedStream:
+    def write(self, *_args, **_kwargs):
+        return 0
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+
+if sys.stdout is None:
+    sys.stdout = _WindowedStream()
+
+if sys.stderr is None:
+    sys.stderr = _WindowedStream()
+
 import requests
 from pyicloud import PyiCloudService
 
