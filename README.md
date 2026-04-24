@@ -31,7 +31,5 @@ Pushing a tag like `v1.0.0` triggers the GitHub Actions workflow in `.github/wor
 --Features to add in the future (hopefully)...---
 - Downloading Backups (in any possible way, but directly backing up to file location isn't possible)
 - Downloading FILES (from iCloud Drive, not just pictures and videos)
-- Notes
-- Voice Memos
 - Is there any way to download iMessages to a location like a harddrive?? (probably not but I'll look into it eventually)
 - Same for emails ^
