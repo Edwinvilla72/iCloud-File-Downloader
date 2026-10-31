@@ -94,9 +94,12 @@ class iCloudDownloaderApp:
             # ---- Case 1: iCloud Photos ----
             if hasattr(file_obj, "download"):
                 self.log(f"Downloading photo/video: {file_name}")
-                response = file_obj.download()
+                content = file_obj.download()
+                if not content:
+                    self.log(f"Skipping {file_name}: No photo/video data returned.")
+                    return
                 with open(file_path, "wb") as f:
-                    f.write(response.raw.read())
+                    f.write(content)
                 self.log(f"Downloaded {file_name} to {folder_path}")
 
             # ---- Case 2: iCloud Drive Files ----
@@ -122,6 +125,7 @@ class iCloudDownloaderApp:
                     self.log(f"Downloaded {file_name} to {folder_path}")
                 else:
                     self.log(f"Failed to download {file_name}: HTTP {response.status_code}")
+                    return
 
             # ---- Optional deletion after download ----
             if self.delete_after_download.get():

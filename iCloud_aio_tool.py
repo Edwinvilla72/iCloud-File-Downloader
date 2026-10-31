@@ -291,9 +291,24 @@ class iCloudDataManagerApp:
             self.api = PyiCloudService(apple_id, password)
             if self.api.requires_2fa:
                 from tkinter.simpledialog import askstring
-                code = askstring("Two-Factor Authentication", "Enter the 2FA code sent to your devices:")
-                if not code or not self.api.validate_2fa_code(code):
-                    raise Exception("Invalid 2FA code.")
+
+                if not self.api.request_2fa_code():
+                    raise Exception(
+                        "Could not request a verification code. "
+                        "Your account may require a security key."
+                    )
+
+                code = askstring(
+                    "Two-Factor Authentication",
+                    "Enter the code from your trusted device or SMS:",
+                    parent=self.root,
+                )
+                if code is None:
+                    self.api = None
+                    self.log("iCloud login cancelled.")
+                    return
+                if not self.api.validate_2fa_code(code.strip()):
+                    raise Exception("Apple rejected the verification code.")
                 if not self.api.is_trusted_session:
                     try:
                         self.api.trust_session()
@@ -302,6 +317,7 @@ class iCloudDataManagerApp:
             messagebox.showinfo("Success", "Logged in to iCloud successfully.")
             self.log("Logged in to iCloud successfully.")
         except Exception as e:
+            self.api = None
             messagebox.showerror("Login Error", str(e))
             self.log(f"Login failed: {e}")
 
@@ -314,9 +330,12 @@ class iCloudDataManagerApp:
             file_path = os.path.join(folder_path, file_name)
             if hasattr(file_obj, "download"):
                 self.log(f"Downloading photo/video: {file_name}")
-                response = file_obj.download()
+                content = file_obj.download()
+                if not content:
+                    self.log(f"Skipping {file_name}: No photo/video data returned.")
+                    return
                 with open(file_path, "wb") as f:
-                    f.write(response.raw.read())
+                    f.write(content)
             else:
                 item_data = getattr(file_obj, "item", {})
                 url = item_data.get("downloadURL", None)
@@ -332,6 +351,7 @@ class iCloudDataManagerApp:
                                 f.write(chunk)
                 else:
                     self.log(f"Failed to download {file_name}: HTTP {response.status_code}")
+                    return
             if self.delete_after_download.get():
                 try:
                     file_obj.delete()
