@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build-desktop:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     permissions:
       contents: write
@@ -28,14 +31,27 @@ jobs:
       - name: Build executable
         run: python -m PyInstaller --noconfirm iCloud_aio_tool.spec
 
+      - name: Test desktop and download services
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/iCloud File Downloading Tool.app" dist/iCloud_aio_tool-macOS.zip
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iCloud_aio_tool-windows
-          path: dist/iCloud_aio_tool.exe
+          name: iCloud_aio_tool-${{ runner.os }}
+          path: |
+            dist/iCloud_aio_tool.exe
+            dist/iCloud_aio_tool-macOS.zip
 
       - name: Attach executable to GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/iCloud_aio_tool.exe
+          files: |
+            dist/iCloud_aio_tool.exe
+            dist/iCloud_aio_tool-macOS.zip

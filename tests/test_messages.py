@@ -1,14 +1,13 @@
 import csv
-import queue
+from contextlib import closing
 import sqlite3
 import struct
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from iCloud_aio_tool import iCloudDataManagerApp, message_text
+from icloud_downloader.messages import MessagesStore, message_text
 
 
 def attributed_body(text):
@@ -30,8 +29,8 @@ class MessagesTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.app = iCloudDataManagerApp.__new__(iCloudDataManagerApp)
-        self.app.log = Mock()
+        self.app = MessagesStore(log=Mock())
+        self.addCleanup(self.app.close)
 
     def database(self):
         path = self.home / 'Library' / 'Messages' / 'chat.db'
@@ -63,12 +62,10 @@ class MessagesTests(unittest.TestCase):
         con.execute("INSERT INTO message VALUES (1, 1, NULL, 'in WAL', NULL)")
         con.commit()
         self.assertTrue(Path(str(path) + '-wal').exists())
-        self.app._messages_temp = tempfile.TemporaryDirectory(dir=self.temp.name)
-        self.addCleanup(self.app._messages_temp.cleanup)
-        with patch('iCloud_aio_tool.Path.home', return_value=self.home), patch(
-                'iCloud_aio_tool.platform.system', return_value='Darwin'):
+        with patch('icloud_downloader.messages.Path.home', return_value=self.home), patch(
+                'icloud_downloader.messages.platform.system', return_value='Darwin'):
             snapshot = self.app.ensure_messages_db_copy()
-        with sqlite3.connect(snapshot) as copied:
+        with closing(sqlite3.connect(snapshot)) as copied:
             self.assertEqual(copied.execute('SELECT text FROM message').fetchone()[0], 'in WAL')
         self.assertFalse((path.parent / 'DBCopies').exists())
 
@@ -96,48 +93,13 @@ class MessagesTests(unittest.TestCase):
             connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10)
             return connection
 
-        with patch('iCloud_aio_tool.sqlite3.connect', side_effect=limited_connect):
+        with patch('icloud_downloader.messages.sqlite3.connect', side_effect=limited_connect):
             exported = self.app._export_chat_by_rowid(1, 'Test chat', str(self.home / 'exports'))
         with exported.open(newline='') as stream:
             rows = list(csv.DictReader(stream))
         self.assertEqual(len(rows), 250)
         self.assertEqual(rows[-1]['text'], 'Message 249 👋')
         self.assertEqual((exported.parent / 'attachments' / '1_photo.txt').read_text(), 'attachment')
-
-    def test_worker_delivers_ui_callback_on_main_thread_and_prevents_overlap(self):
-        self.app._ui_queue = queue.Queue()
-        self.app._messages_busy = False
-        self.app.messages_status = Mock()
-        threads = []
-        done = Mock(side_effect=lambda _: threads.append(threading.current_thread()))
-        work = Mock(side_effect=lambda: threading.current_thread())
-        self.app._messages_task('Loading', work, done)
-        self.app._messages_task('Duplicate', work, done)
-        deliver = self.app._ui_queue.get(timeout=5)
-        done.assert_not_called()
-        deliver()
-        work.assert_called_once()
-        self.assertIsNot(done.call_args.args[0], threading.main_thread())
-        self.assertEqual(threads, [threading.main_thread()])
-
-    def test_render_yields_between_batches(self):
-        self.app.root = Mock()
-        self.app.messages_status = Mock()
-        self.app.conv_canvas = Mock()
-        self.app.current_loaded = 0
-        self.app._messages_busy = True
-        self.app._add_message_bubble = Mock()
-        rows = [(i, i, 1, '', 'hello') for i in range(25)]
-        page = Mock()
-        self.app._render_message_batch(page, rows, {}, 0, 25, True)
-        self.assertEqual(self.app._add_message_bubble.call_count, 10)
-        self.assertTrue(self.app._messages_busy)
-        self.app.root.after.call_args.args[1]()
-        self.assertEqual(self.app._add_message_bubble.call_count, 20)
-        self.app.root.after.call_args.args[1]()
-        self.assertEqual(self.app._add_message_bubble.call_count, 25)
-        self.assertEqual(self.app.current_loaded, 25)
-        self.assertFalse(self.app._messages_busy)
 
 
 if __name__ == '__main__':
