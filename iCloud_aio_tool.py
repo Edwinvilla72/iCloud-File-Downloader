@@ -7,10 +7,10 @@ Tabs:
 - Drive (Download all iCloud Drive files preserving folder structure)
 - Emails (IMAP: save .eml + extract attachments)
 - Backups (device list + OS-specific instructions)
-- Messages (macOS only: export + in-app viewer with thumbnails, 500 recent + Load More)
+- Messages (macOS only: export + in-app viewer with thumbnails, 100 recent + Load More)
 
 Dependencies:
-    pip install pyicloud requests pandas pillow
+    pip install pyicloud requests pandas pillow pytypedstream
 """
 
 import os
@@ -21,6 +21,10 @@ import sqlite3
 import platform
 import threading
 import subprocess
+import queue
+import tempfile
+import time
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from tkinter import Tk, StringVar, BooleanVar, filedialog, messagebox
@@ -57,6 +61,32 @@ from email.header import decode_header, make_header
 # CSV + thumbnails
 import pandas as pd
 from PIL import Image, ImageTk
+try:
+    import typedstream
+    from typedstream.types.foundation import NSString
+except ImportError:
+    typedstream = None
+
+
+def message_text(text, attributed_body):
+    """Decode the body as a typedstream, never by slicing binary data as text."""
+    if text:
+        return text
+    if not attributed_body:
+        return ""
+    if typedstream is None:
+        return "[Message text unavailable: install pytypedstream]"
+    try:
+        body = typedstream.unarchive_from_data(bytes(attributed_body))
+        # NSAttributedString's first field is its backing NSString. Ignore
+        # attribute dictionaries so links and formatting never become body text.
+        if body.clazz.name in (b"NSAttributedString", b"NSMutableAttributedString"):
+            value = body.contents[0].values[0]
+            if isinstance(value, NSString):
+                return value.value
+    except Exception:
+        pass
+    return "[Message text unavailable: unsupported attributedBody]"
 
 # ---------------------------
 # Utilities
@@ -118,10 +148,15 @@ class iCloudDataManagerApp:
         self.current_chat_rowid = None
         self.current_chat_display = ""
         self.current_loaded = 0       # number of messages currently displayed
-        self.messages_per_page = 500  # chunk size for "Load More"
+        self.messages_per_page = 100
         self._thumb_refs = []         # keep PhotoImage refs alive
+        self._ui_queue = queue.Queue()
+        self._messages_busy = False
+        self._messages_temp = tempfile.TemporaryDirectory(prefix="icloud-messages-")
+        self._message_pages = []
 
         self.create_widgets()
+        self.root.after(50, self._drain_ui_queue)
 
     # ---------------------------
     # UI SETUP
@@ -223,22 +258,23 @@ class iCloudDataManagerApp:
         top.grid(row=0, column=0, sticky="ew", **pad)
         top.columnconfigure(3, weight=1)
 
-        ttk.Button(top, text="Load Chats", command=lambda: threading.Thread(target=self.load_chats, daemon=True).start()).grid(row=0, column=0, **pad)
+        ttk.Button(top, text="Load Chats", command=self.load_chats).grid(row=0, column=0, **pad)
         ttk.Label(top, text="Select Chat:").grid(row=0, column=1, sticky="e", **pad)
         self.chat_combo = ttk.Combobox(top, textvariable=self.selected_chat_display, width=50, state="readonly", values=[])
         self.chat_combo.grid(row=0, column=2, sticky="ew", **pad)
-        ttk.Button(top, text="Open", command=lambda: threading.Thread(target=self.open_selected_chat, daemon=True).start()).grid(row=0, column=3, sticky="w", **pad)
+        ttk.Button(top, text="Open", command=self.open_selected_chat).grid(row=0, column=3, sticky="w", **pad)
 
         mid = ttk.Frame(self.messages_frame)
         mid.grid(row=1, column=0, sticky="w", **pad)
-        ttk.Button(mid, text="Load More (older 500)", command=lambda: threading.Thread(target=self.load_more_messages, daemon=True).start()).grid(row=0, column=0, **pad)
-        ttk.Button(mid, text="Export Chat", command=lambda: threading.Thread(target=self.export_selected_chat, daemon=True).start()).grid(row=0, column=1, **pad)
+        ttk.Button(mid, text="Load More (older 100)", command=self.load_more_messages).grid(row=0, column=0, **pad)
+        ttk.Button(mid, text="Export Chat", command=self.export_selected_chat).grid(row=0, column=1, **pad)
         ttk.Button(mid, text="Open Attachments Folder", command=self.open_attachments_folder).grid(row=0, column=2, **pad)
 
         info = ("Viewer notes:\n"
-                "• Loads the 500 most recent messages first; use 'Load More' for older messages.\n"
+                "• Loads the 100 most recent messages first; use 'Load More' for older messages.\n"
                 "• Blue = Me, Gray = Other. Thumbnails shown for common image types.\n"
-                "• If permissions error appears, grant Full Disk Access to Python (System Settings → Privacy & Security).")
+                "• Uses messages downloaded to this Mac. 'Load Chats' refreshes the snapshot.\n"
+                "• Permission errors: grant Full Disk Access to the app launching this tool, then relaunch it.")
         ttk.Label(self.messages_frame, text=info, foreground="#555").grid(row=2, column=0, sticky="w", **pad)
 
         # Scrollable conversation area
@@ -258,22 +294,68 @@ class iCloudDataManagerApp:
 
         def _on_inner_config(event):
             self.conv_canvas.configure(scrollregion=self.conv_canvas.bbox("all"))
-            # Make width responsive
-            self.conv_canvas.itemconfig(self.conv_inner_id, width=self.conv_canvas.winfo_width())
 
         def _on_canvas_config(event):
             self.conv_canvas.itemconfig(self.conv_inner_id, width=event.width)
 
         self.conv_inner.bind("<Configure>", _on_inner_config)
         self.conv_canvas.bind("<Configure>", _on_canvas_config)
+        self.messages_status = StringVar(value="Ready")
+        ttk.Label(self.messages_frame, textvariable=self.messages_status).grid(row=4, column=0, sticky="w", **pad)
 
     # ---------------------------
     # Helpers
     # ---------------------------
     def log(self, message: str):
+        if threading.current_thread() is not threading.main_thread():
+            self._ui_queue.put(lambda: self.log(message))
+            return
         self.log_output.insert("end", message + "\n")
         self.log_output.see("end")
-        self.root.update_idletasks()
+
+    def _drain_ui_queue(self):
+        try:
+            for _ in range(20):
+                callback = self._ui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception:
+                    self.root.report_callback_exception(*sys.exc_info())
+        except queue.Empty:
+            pass
+        self.root.after(50, self._drain_ui_queue)
+
+    def _messages_error(self, error):
+        self._messages_busy = False
+        detail = str(error)
+        if isinstance(error, PermissionError) or "unable to open database" in detail.lower() or "authorization denied" in detail.lower():
+            detail += ("\n\nIn System Settings → Privacy & Security → Full Disk Access, "
+                       "enable the app launching this tool (Terminal, your IDE, or the packaged app), "
+                       "then quit and relaunch it.")
+        self.messages_status.set("Failed; see error details.")
+        self.log(f"Messages: {detail}")
+        messagebox.showerror("Messages", detail)
+
+    def _messages_task(self, status, work, done):
+        if self._messages_busy:
+            return
+        self._messages_busy = True
+        self.messages_status.set(status)
+
+        def worker():
+            try:
+                result = work()
+            except Exception as error:
+                self._ui_queue.put(lambda error=error: self._messages_error(error))
+            else:
+                def deliver():
+                    try:
+                        done(result)
+                    except Exception as error:
+                        self._messages_error(error)
+                self._ui_queue.put(deliver)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def select_folder(self):
         folder = filedialog.askdirectory()
@@ -481,68 +563,62 @@ Notes
     # Messages: DB copy, chat list, export, viewer
     # ---------------------------
     def ensure_messages_db_copy(self):
+        """Take a WAL-aware snapshot; called only by the Messages worker."""
         if platform.system() != "Darwin":
-            messagebox.showwarning("Messages", "Messages is macOS-only.")
-            return None
+            raise RuntimeError("Messages is macOS-only.")
         src_db = Path.home() / "Library" / "Messages" / "chat.db"
-        if not src_db.exists():
-            self.log("Messages DB not found at ~/Library/Messages/chat.db")
-            messagebox.showerror("Messages", "Messages DB not found at ~/Library/Messages/chat.db")
-            return None
-        tmp_dir = Path.home() / "Library" / "Messages" / "DBCopies"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        dst_db = tmp_dir / f"chat_copy_{int(datetime.now().timestamp())}.db"
-        try:
-            shutil.copy2(src_db, dst_db)
-            self.messages_db_copy = str(dst_db)
-            return self.messages_db_copy
-        except PermissionError:
-            self.log("Permission denied. Grant Full Disk Access to Python and retry.")
-            messagebox.showerror("Permissions", "Grant Full Disk Access to Python (System Settings → Privacy & Security).")
-            return None
-        except Exception as e:
-            self.log(f"Copy chat.db failed: {e}")
-            messagebox.showerror("Messages", f"Failed to copy chat.db: {e}")
-            return None
+        dst_db = Path(self._messages_temp.name) / "chat.db"
+        deadline = time.monotonic() + 20
+
+        def progress(_status, _remaining, _total):
+            if time.monotonic() > deadline:
+                raise TimeoutError("Messages database is busy. Wait a moment, then try Load Chats again.")
+
+        # mode=ro prevents accidentally creating or modifying Apple's database.
+        with closing(sqlite3.connect(src_db.as_uri() + "?mode=ro", uri=True, timeout=5)) as source:
+            with closing(sqlite3.connect(dst_db)) as target:
+                source.backup(target, pages=256, progress=progress, sleep=0.05)
+        self.messages_db_copy = str(dst_db)
+        return self.messages_db_copy
 
     def load_chats(self):
-        if not self.download_dir.get():
-            self.log("Choose a download folder first (Login tab).")
-            return
-        db_path = self.ensure_messages_db_copy()
-        if not db_path:
-            return
-        try:
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            cur.execute("""
-                SELECT c.ROWID,
-                       COALESCE(c.display_name, c.chat_identifier, 'Unknown') AS name,
-                       c.chat_identifier
-                FROM chat c
-                ORDER BY name COLLATE NOCASE;
-            """)
-            rows = cur.fetchall()
-            con.close()
+        def work():
+            db_path = self.ensure_messages_db_copy()
+            with closing(sqlite3.connect(db_path)) as con:
+                return con.execute("""
+                    SELECT c.ROWID,
+                           COALESCE(NULLIF(c.display_name, ''), c.chat_identifier, 'Unknown'),
+                           c.chat_identifier
+                    FROM chat c ORDER BY 2 COLLATE NOCASE;
+                """).fetchall()
 
+        def done(rows):
             self.chat_rows, self.chat_map = [], {}
             values = []
             for rowid, name, identifier in rows:
                 display = f"{name}  ({identifier})" if identifier and identifier != name else name
-                display = display.strip() or f"Chat {rowid}"
+                # Different conversations can share a phone number or title.
+                display = f"{display.strip() or 'Chat'} [#{rowid}]"
                 self.chat_rows.append({"rowid": rowid, "display": display, "identifier": identifier or ""})
                 self.chat_map[display] = rowid
                 values.append(display)
-
             self.chat_combo["values"] = values
-            if values:
-                self.chat_combo.current(0)
+            self.selected_chat_display.set(values[0] if values else "")
+            self.current_chat_rowid = None
+            self.current_loaded = 0
+            for widget in self.conv_inner.winfo_children():
+                widget.destroy()
+            self._thumb_refs.clear()
+            self._message_pages.clear()
+            self._messages_busy = False
+            self.messages_status.set(f"Loaded {len(values)} chats.")
             self.log(f"Loaded {len(values)} chats.")
-        except Exception as e:
-            self.log(f"Load chats error: {e}")
-            messagebox.showerror("Messages", f"Failed to load chats: {e}")
+
+        self._messages_task("Reading Messages database…", work, done)
 
     def open_selected_chat(self):
+        if self._messages_busy:
+            return
         display = self.selected_chat_display.get().strip()
         if not display:
             messagebox.showwarning("Messages", "Select a chat first.")
@@ -555,6 +631,7 @@ Notes
         self.current_chat_display = display
         self.current_loaded = 0
         self._thumb_refs.clear()
+        self._message_pages.clear()
         # Clear the conversation view
         for w in self.conv_inner.winfo_children():
             w.destroy()
@@ -562,7 +639,7 @@ Notes
         self._load_chat_chunk(initial=True)
 
     def load_more_messages(self):
-        if not self.current_chat_rowid:
+        if self._messages_busy or not self.current_chat_rowid:
             return
         self._load_chat_chunk(initial=False)
 
@@ -585,7 +662,7 @@ Notes
                 m.date,
                 m.is_from_me,
                 COALESCE(h.id, '') as handle_id,
-                m.text
+                m.text, m.attributedBody
             FROM message m
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             LEFT JOIN handle h ON h.ROWID = m.handle_id
@@ -595,7 +672,7 @@ Notes
         """, (chat_rowid, limit, offset))
         rows = cur.fetchall()
         rows.reverse()  # display ascending
-        return rows
+        return [(*row[:4], message_text(row[4], row[5])) for row in rows]
 
     def _attachments_for_message_ids(self, con, msg_ids):
         if not msg_ids:
@@ -616,54 +693,90 @@ Notes
             result.setdefault(mid, []).append((filename, transfer_name))
         return result
 
+    def _prepare_attachments(self, att_map):
+        """Resolve files and decode image pixels on the worker, away from Tk."""
+        prepared = {}
+        attach_root = Path.home() / "Library" / "Messages" / "Attachments"
+        for mid, attachments in att_map.items():
+            items = []
+            for filename, transfer_name in attachments:
+                src = Path(filename).expanduser() if filename else None
+                if src and not src.is_absolute():
+                    src = attach_root / src
+                if (not src or not src.is_file()) and transfer_name:
+                    src = attach_root / transfer_name
+                thumbnail = None
+                if src and src.is_file():
+                    if is_image_file(src):
+                        try:
+                            with Image.open(src) as image:
+                                image.thumbnail((280, 280))
+                                thumbnail = image.convert("RGB").copy()
+                        except Exception:
+                            pass
+                    items.append((src, thumbnail))
+                else:
+                    items.append((None, transfer_name or filename or "Attachment unavailable"))
+            prepared[mid] = items
+        return prepared
+
     def _load_chat_chunk(self, initial: bool):
-        if not self.messages_db_copy:
-            db_path = self.ensure_messages_db_copy()
-            if not db_path:
+        chat_id, offset = self.current_chat_rowid, self.current_loaded
+
+        def work():
+            with closing(sqlite3.connect(self.messages_db_copy)) as con:
+                total = self._get_total_messages_for_chat(con, chat_id)
+                rows = self._fetch_messages_chunk(con, chat_id, offset, self.messages_per_page)
+                att_map = self._attachments_for_message_ids(con, [r[0] for r in rows])
+            return total, rows, self._prepare_attachments(att_map)
+
+        def done(result):
+            total, rows, attachments = result
+            if not rows:
+                self._messages_busy = False
+                self.messages_status.set(f"All {total} messages loaded.")
                 return
+            page = Frame(self.conv_inner)
+            # Older pages belong above the messages already on screen.
+            if self._message_pages:
+                page.pack(fill="x", before=self._message_pages[0])
+            else:
+                page.pack(fill="x")
+            self._message_pages.insert(0, page)
+            self._render_message_batch(page, rows, attachments, 0, total, initial)
+
+        self._messages_task("Loading messages…", work, done)
+
+    def _render_message_batch(self, page, rows, attachments, index, total, initial):
         try:
-            con = sqlite3.connect(self.messages_db_copy)
-            total = self._get_total_messages_for_chat(con, self.current_chat_rowid)
-            offset = self.current_loaded
-            limit = self.messages_per_page
-            rows = self._fetch_messages_chunk(con, self.current_chat_rowid, offset, limit)
-            msg_ids = [r[0] for r in rows]
-            att_map = self._attachments_for_message_ids(con, msg_ids)
-            con.close()
-
-            if initial and total > self.messages_per_page:
-                # Add a subtle notice at top
-                Label(self.conv_inner, text=f"Showing latest {self.messages_per_page} of {total}. Click 'Load More' for older messages.",
-                      fg="#555").pack(anchor="center", pady=(0,6))
-
-            for (msg_id, date_val, is_from_me, handle_id, text) in rows:
-                self._add_message_bubble(msg_id, date_val, is_from_me, handle_id, text, att_map.get(msg_id, []))
-
+            # Yield to macOS between small batches so input and repaint continue.
+            end = min(index + 10, len(rows))
+            for msg_id, date_val, is_from_me, handle_id, text in rows[index:end]:
+                self._add_message_bubble(page, msg_id, date_val, is_from_me, handle_id, text,
+                                         attachments.get(msg_id, []))
+            self.messages_status.set(f"Displaying messages… {end}/{len(rows)}")
+            if end < len(rows):
+                self.root.after(10, lambda: self._render_message_batch(
+                    page, rows, attachments, end, total, initial))
+                return
             self.current_loaded += len(rows)
+            self._messages_busy = False
+            self.messages_status.set(f"Showing {self.current_loaded} of {total} messages.")
+            self.conv_canvas.after_idle(lambda: self.conv_canvas.yview_moveto(1.0 if initial else 0.0))
+        except Exception as error:
+            self._messages_error(error)
 
-            # Auto-scroll to bottom on initial open
-            if initial:
-                self.conv_canvas.after(50, lambda: self.conv_canvas.yview_moveto(1.0))
-
-            if self.current_loaded >= total:
-                # All loaded — maybe show a small note
-                Label(self.conv_inner, text="No more messages.", fg="#888").pack(anchor="center", pady=(6,6))
-
-        except Exception as e:
-            self.log(f"Viewer load error: {e}")
-            messagebox.showerror("Messages", f"Failed to load messages: {e}")
-
-    def _add_message_bubble(self, msg_id, date_val, is_from_me, handle_id, text, attachments):
+    def _add_message_bubble(self, parent, msg_id, date_val, is_from_me, handle_id, text, attachments):
         # Simple bubble styling
         me = (is_from_me == 1)
         bg = "#cce4ff" if me else "#e8e8e8"
         fg = "#000000"
         align = "e" if me else "w"
-        outer = Frame(self.conv_inner)
+        outer = Frame(parent)
         outer.pack(fill="x", padx=6, pady=3)
         inner = Frame(outer, bg=bg, bd=0, highlightthickness=0)
         # width constraint for readability
-        max_width = min(self.conv_inner.winfo_width() or 600, 600)
+        max_width = max(240, min(self.conv_canvas.winfo_width(), 600))
 
         # Text content
         dt = apple_ns_to_unix(date_val)
@@ -674,38 +787,20 @@ Notes
         lbl = Label(inner, text=text, wraplength=max_width-40, justify="left", bg=bg, fg=fg)
         lbl.pack(anchor="w", padx=10, pady=(8, 4))
 
-        # Attachments (thumbnails or links)
-        if attachments:
-            home = Path.home()
-            attach_root = home / "Library" / "Messages" / "Attachments"
-            for (filename, transfer_name) in attachments:
-                src = None
-                if filename:
-                    fpath = Path(filename).expanduser()
-                    src = fpath if fpath.is_absolute() else attach_root / fpath
-                if (not src or not src.exists()) and transfer_name:
-                    alt = attach_root / transfer_name
-                    if alt.exists():
-                        src = alt
-                if src and src.exists():
-                    if is_image_file(src):
-                        try:
-                            im = Image.open(src)
-                            im.thumbnail((280, 280))
-                            tkim = ImageTk.PhotoImage(im)
-                            img_label = Label(inner, image=tkim, bg=bg)
-                            img_label.image = tkim
-                            self._thumb_refs.append(tkim)
-                            img_label.pack(anchor="w", padx=10, pady=(0,6))
-                            img_label.bind("<Button-1>", lambda e, p=str(src): self._open_in_finder(p))
-                        except Exception as e:
-                            link = Label(inner, text=f"[Attachment: {src.name}]", fg="#0645AD", bg=bg, cursor="hand2")
-                            link.pack(anchor="w", padx=10, pady=(0,6))
-                            link.bind("<Button-1>", lambda e, p=str(src): self._open_in_finder(p))
-                    else:
-                        link = Label(inner, text=f"[Attachment: {src.name}]", fg="#0645AD", bg=bg, cursor="hand2")
-                        link.pack(anchor="w", padx=10, pady=(0,6))
-                        link.bind("<Button-1>", lambda e, p=str(src): self._open_in_finder(p))
+        # Only Tk image creation happens here; disk reads and resizing are done.
+        for src, thumbnail in attachments:
+            if src is None:
+                Label(inner, text=f"[Unavailable: {thumbnail}]", bg=bg, fg="#555").pack(
+                    anchor="w", padx=10, pady=(0, 6))
+                continue
+            if thumbnail is not None:
+                tkim = ImageTk.PhotoImage(thumbnail, master=self.root)
+                self._thumb_refs.append(tkim)
+                link = Label(inner, image=tkim, bg=bg)
+            else:
+                link = Label(inner, text=f"[Attachment: {src.name}]", fg="#0645AD", bg=bg, cursor="hand2")
+            link.pack(anchor="w", padx=10, pady=(0, 6))
+            link.bind("<Button-1>", lambda e, p=str(src): self._open_in_finder(p))
 
         # Timestamp
         Label(inner, text=f"{sender} • {ts}", bg=bg, fg="#333").pack(anchor="w", padx=10, pady=(0,8))
@@ -724,6 +819,8 @@ Notes
 
     # Export features
     def export_selected_chat(self):
+        if self._messages_busy:
+            return
         display = self.selected_chat_display.get().strip()
         if not display:
             messagebox.showwarning("Messages", "Please select a chat first.")
@@ -732,24 +829,33 @@ Notes
         if not rowid:
             messagebox.showwarning("Messages", "Could not resolve selected chat.")
             return
-        self._export_chat_by_rowid(rowid, display)
+        directory = self.download_dir.get()
+        if not directory:
+            messagebox.showwarning("Messages", "Choose a download folder in the Login tab first.")
+            return
 
-    def _export_chat_by_rowid(self, chat_rowid: int, chat_display: str):
+        def done(csv_path):
+            self._messages_busy = False
+            self.messages_status.set(f"Export complete: {csv_path}")
+
+        self._messages_task("Exporting chat…",
+                            lambda: self._export_chat_by_rowid(rowid, display, directory), done)
+
+    def _export_chat_by_rowid(self, chat_rowid: int, chat_display: str, directory: str):
         if not self.messages_db_copy:
             db_path = self.ensure_messages_db_copy()
             if not db_path:
                 return
         chat_name = sanitize_filename(chat_display) or f"chat_{chat_rowid}"
-        base_dir = Path(self.download_dir.get()) / "Messages" / chat_name
+        base_dir = Path(directory) / "Messages" / chat_name
         attachments_dir = base_dir / "attachments"
         base_dir.mkdir(parents=True, exist_ok=True)
         attachments_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            con = sqlite3.connect(self.messages_db_copy)
+        with closing(sqlite3.connect(self.messages_db_copy)) as con:
             cur = con.cursor()
             cur.execute("""
-                SELECT m.ROWID, m.date, m.is_from_me, COALESCE(h.id, ''), m.text
+                SELECT m.ROWID, m.date, m.is_from_me, COALESCE(h.id, ''), m.text, m.attributedBody
                 FROM message m
                 JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                 LEFT JOIN handle h ON h.ROWID = m.handle_id
@@ -758,26 +864,27 @@ Notes
             """, (chat_rowid,))
             msgs = cur.fetchall()
             records = []
-            for (msg_id, date_val, is_from_me, handle_id, text) in msgs:
+            for (msg_id, date_val, is_from_me, handle_id, text, body) in msgs:
                 dt = apple_ns_to_unix(date_val)
                 dt_str = dt.isoformat(sep=" ", timespec="seconds") if dt else ""
                 direction = "Me" if is_from_me == 1 else (handle_id or "Other")
-                records.append({"message_id": msg_id, "datetime_utc": dt_str, "from": direction, "text": text or ""})
+                records.append({"message_id": msg_id, "datetime_utc": dt_str, "from": direction, "text": message_text(text, body)})
 
             df = pd.DataFrame(records, columns=["message_id", "datetime_utc", "from", "text"])
             csv_path = base_dir / f"chat_with_{sanitize_filename(chat_name)}.csv"
             df.to_csv(csv_path, index=False, encoding="utf-8")
             self.log(f"Saved messages CSV: {csv_path}")
 
-            msg_ids = [r["message_id"] for r in records]
-            if msg_ids:
-                q_marks = ",".join("?" for _ in msg_ids)
-                cur.execute(f"""
+            if records:
+                # Join by chat rather than binding every message ID: large chats
+                # otherwise exceed SQLite's variable limit during export.
+                cur.execute("""
                     SELECT maj.message_id, a.filename, a.transfer_name
                     FROM message_attachment_join maj
                     JOIN attachment a ON a.ROWID = maj.attachment_id
-                    WHERE maj.message_id IN ({q_marks});
-                """, msg_ids)
+                    JOIN chat_message_join cmj ON cmj.message_id = maj.message_id
+                    WHERE cmj.chat_id = ?;
+                """, (chat_rowid,))
                 atts = cur.fetchall()
                 home = Path.home()
                 attach_root = home / "Library" / "Messages" / "Attachments"
@@ -801,12 +908,12 @@ Notes
                             self.log(f"Attachment copy error ({src}): {e}")
                 self.log(f"Saved {copied} attachment(s) to: {attachments_dir}")
 
-            con.close()
-        except Exception as e:
-            self.log(f"Export chat error: {e}")
-            messagebox.showerror("Messages", f"Failed to export chat: {e}")
+        return csv_path
 
     def open_attachments_folder(self):
+        if not self.download_dir.get():
+            messagebox.showwarning("Messages", "Choose a download folder in the Login tab first.")
+            return
         if not self.current_chat_rowid:
             messagebox.showinfo("Messages", "Open a chat first.")
             return

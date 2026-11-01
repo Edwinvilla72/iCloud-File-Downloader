@@ -12,8 +12,12 @@ Upon opening the file, users are prompted to log into their iCloud account. This
 - **NOTE**: You have the option to delete photos/videos and iCloud Drive items automatically when they are finished downloading. Though I have seen consistent success with personal testing, **_DO THIS AT YOUR OWN RISK_**! I suggest disabling this option and downloading first, verifying, then deleting manually.
 
 #### iMessages (ONLY ON MacOS)
-- If you have iMessage in use on your MacBook, the messages on the device (not ALL messages on iCloud) may be saved to a file as a backup. This does NOT include images, files, apple cash transactions, or literally anything that isn't a simple text (though emojis are safe). 
-##### This feature is still in development. Organization may be implemented in the future based on phone number, but for now, everything is saved onto one file, so uhh, you're welcome!  :D
+- Reads conversations downloaded to this Mac from `~/Library/Messages/chat.db`; iCloud login is not required for this tab.
+- Click **Load Chats**, select a conversation, then **Open**. The viewer loads the latest 100 messages; **Load More** adds older messages above them. Load Chats refreshes the database snapshot.
+- Database reads, thumbnail preparation, and exports run in the background. Rendering happens in small batches, and a status line shows progress. Wait for the current operation before starting another.
+- If access is denied, enable **System Settings → Privacy & Security → Full Disk Access** for the app launching the tool (Terminal, your IDE, or the packaged app), then quit and relaunch that app.
+- Choose a download folder in the Login tab before exporting. **Export Chat** saves a CSV and locally available attachments. Files not downloaded to this Mac cannot be exported; HEIC images appear as attachment links.
+- Install dependencies from `requirements.txt` for support for modern `attributedBody` message text. Unsupported message bodies are marked explicitly rather than silently exported as blank.
 
 I felt bad for making people wait like 2 years for this so I'm doing my best to make the installation approachable while having a few more features in there. 
 

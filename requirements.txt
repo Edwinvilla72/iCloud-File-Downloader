@@ -31,3 +31,4 @@ srp==1.0.22
 tzdata==2025.3
 tzlocal==5.3.1
 urllib3==2.6.3
+pytypedstream==0.1.0
